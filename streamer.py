@@ -19,7 +19,9 @@ class Streamer:
         # Your code goes here!  The code below should be changed!
 
         # for now I'm just sending the raw application-level data in one UDP payload
-        self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
+        for i in range(0, len(data_bytes), 1472):
+            offset = min(i+1472, len(data_bytes))
+            self.socket.sendto(data_bytes[i:offset], (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
