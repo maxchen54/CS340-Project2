@@ -4,9 +4,12 @@ from lossy_socket import LossyUDP
 from socket import INADDR_ANY
 
 import struct
+import concurrent.futures
+import threading
 
 HEADER_FORMAT = "!I"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -21,6 +24,30 @@ class Streamer:
         self.send_seq = 0
         self.expected_seq = 0
         self.recv_buffer = {}
+        self.closed = False
+
+        self.lock = threading.Lock()
+        self.condval = threading.Condition(self.lock)
+
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.executor.submit(self.listener)
+
+    def listener(self):
+        while not self.closed:
+            try:
+                data, addr = self.socket.recvfrom()  # Return a packet
+
+                header = data[:HEADER_SIZE]
+                payload = data[HEADER_SIZE:]
+
+                (seq,) = struct.unpack(HEADER_FORMAT, header)
+
+                with self.condval:
+                    self.recv_buffer[seq] = payload
+                    self.condval.notify_all()
+            except Exception as e:
+                print("Listener died!")
+                print(e)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -33,33 +60,30 @@ class Streamer:
 
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
-            self.send_seq += 1 
+            self.send_seq += 1
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""        
-        # this sample code just calls the recvfrom method on the LossySocket
-        
-        while True:
-            data, addr = self.socket.recvfrom() # Return a packet
-            
-            header = data[:HEADER_SIZE]
-            payload = data[HEADER_SIZE:]
-            
-            (seq,) = struct.unpack(HEADER_FORMAT, header) 
-            
-            self.recv_buffer[seq] = payload
 
-            if self.expected_seq in self.recv_buffer:
-                out = self.recv_buffer.pop(self.expected_seq) # out is the payload
-                self.expected_seq += 1
-                return out
-        
-            
+        with self.condval:
+            while self.expected_seq not in self.recv_buffer and not self.closed:
+                self.condval.wait()
 
+            if self.closed and self.expected_seq not in self.recv_buffer:
+                return b""
 
+            out = self.recv_buffer.pop(self.expected_seq)
+            self.expected_seq += 1
+            return out
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        pass
+        self.closed = True
+        self.socket.stoprecv()
+
+        with self.condval:
+            self.condval.notify_all()
+
+        self.executor.shutdown(wait=True)
