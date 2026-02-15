@@ -6,8 +6,10 @@ from socket import INADDR_ANY
 import struct
 import concurrent.futures
 import threading
+import time
 
-HEADER_FORMAT = "!I"
+HEADER_FORMAT = "!BI" # B: 1 byte for packet type, I: 4 bytes for sequence number
+# We will set 0=Data packet, 1=ACK packet
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 
@@ -25,6 +27,8 @@ class Streamer:
         self.expected_seq = 0
         self.recv_buffer = {}
         self.closed = False
+
+        self.ack = True # Initialized to true so first packet can be sent
 
         self.lock = threading.Lock()
         self.condval = threading.Condition(self.lock)
@@ -44,11 +48,20 @@ class Streamer:
                 header = data[:HEADER_SIZE]
                 payload = data[HEADER_SIZE:]
 
-                (seq,) = struct.unpack(HEADER_FORMAT, header)
+                (type, seq) = struct.unpack(HEADER_FORMAT, header)
 
-                with self.condval:
-                    self.recv_buffer[seq] = payload
-                    self.condval.notify_all()
+                if type == 0: # Data packet, send ACK Back
+                    ack_header = struct.pack(HEADER_FORMAT, 1, seq)
+                    self.socket.sendto(ack_header, addr)
+
+                    # Store data in buffer
+                    with self.condval:
+                        self.recv_buffer[seq] = payload
+                        self.condval.notify_all()
+
+                elif type == 1: # ACK packet, send nothing
+                    with self.lock:
+                        self.ack = True
             except Exception as e:
                 print("Listener died!")
                 print(e)
@@ -59,11 +72,18 @@ class Streamer:
         for i in range(0, len(data_bytes), 1472 - HEADER_SIZE):
             offset = min(i + (1472 - HEADER_SIZE), len(data_bytes))
             payload = data_bytes[i:offset]
-            header = struct.pack(HEADER_FORMAT, self.send_seq)
+            header = struct.pack(HEADER_FORMAT, 0, self.send_seq) # 0 indicate this packet is data, not ack
             packet = header + payload
 
-            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-
+            # Wait for ACK from previous packet
+            with self.lock: 
+                while not self.ack:
+                    self.lock.release()
+                    time.sleep(0.01)
+                    self.lock.acquire()
+                
+                self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                self.ack = False
             self.send_seq += 1
 
     def recv(self) -> bytes:
