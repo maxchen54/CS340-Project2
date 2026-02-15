@@ -37,6 +37,10 @@ class Streamer:
             try:
                 data, addr = self.socket.recvfrom()  # Return a packet
 
+                # Check if socket was closed (returns empty data)
+                if len(data) < HEADER_SIZE:
+                    continue
+
                 header = data[:HEADER_SIZE]
                 payload = data[HEADER_SIZE:]
 
@@ -52,8 +56,8 @@ class Streamer:
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
         # for now I'm just sending the raw application-level data in one UDP payload
-        for i in range(0, len(data_bytes), 1472):
-            offset = min(i+1472, len(data_bytes))
+        for i in range(0, len(data_bytes), 1472 - HEADER_SIZE):
+            offset = min(i + (1472 - HEADER_SIZE), len(data_bytes))
             payload = data_bytes[i:offset]
             header = struct.pack(HEADER_FORMAT, self.send_seq)
             packet = header + payload
