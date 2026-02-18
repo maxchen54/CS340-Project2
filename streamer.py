@@ -58,31 +58,28 @@ class Streamer:
 
                 (type, seq, hash) = struct.unpack(HEADER_FORMAT, header)
 
+                # Check for hash immediately, and ignore packet if it's corrupted
+                check_hash = hashlib.md5(struct.pack("!BI", type, seq) + payload).digest()
+                if check_hash != hash:
+                    continue  
+
                 if type == 0: # Data packet, send ACK Back
-                    # Check hash result
-                    check_hash = hashlib.md5(payload).digest()
+                    ack_hash = hashlib.md5(struct.pack("!BI", 1, seq) + b'').digest()
+                    ack_header = struct.pack(HEADER_FORMAT, 1, seq, ack_hash)
+                    self.socket.sendto(ack_header, addr)
 
-                    # Only buffer packet if hash matches. Otherwise do nothing  
-                    if check_hash == hash:
-                        # Include an empty hash for non-data packets
-                        empty_hash = hashlib.md5(b'').digest()
-                        ack_header = struct.pack(HEADER_FORMAT, 1, seq, empty_hash)
-                        self.socket.sendto(ack_header, addr)
+                    # Store data in buffer
+                    with self.condval:
+                        self.recv_buffer[seq] = payload
+                        self.condval.notify_all()
 
-                        # Store data in buffer
-                        with self.condval:
-                            self.recv_buffer[seq] = payload
-                            self.condval.notify_all()
-
-                elif type == 1: # ACK packet, send nothing
+                elif type == 1: # ACK packet
                     with self.lock:
                         # Only remove the specific ACKed packet
                         if seq in self.send_buffer:
                             del self.send_buffer[seq]
-                        # Advance base past consecutive packets no longer in send_buffer
                         while self.base not in self.send_buffer and self.base < self.send_seq:
                             self.base += 1
-                        # Reset or cancel timer
                         if self.send_buffer:
                             self.start_timer()
                         else:
@@ -91,8 +88,8 @@ class Streamer:
                                 self.timer = None
 
                 elif type == 2: # FIN packet, send FIN-ACK back
-                    empty_hash = hashlib.md5(b'').digest()
-                    fin_ack_header = struct.pack(HEADER_FORMAT, 3, seq, empty_hash)
+                    fin_ack_hash = hashlib.md5(struct.pack("!BI", 3, seq) + b'').digest()
+                    fin_ack_header = struct.pack(HEADER_FORMAT, 3, seq, fin_ack_hash)
                     self.socket.sendto(fin_ack_header, addr)
                     with self.lock: 
                         self.fin = True 
@@ -111,7 +108,7 @@ class Streamer:
         for i in range(0, len(data_bytes), 1472 - HEADER_SIZE):
             offset = min(i + (1472 - HEADER_SIZE), len(data_bytes))
             payload = data_bytes[i:offset]
-            hash = hashlib.md5(payload).digest()
+            hash = hashlib.md5(struct.pack("!BI", 0, self.send_seq) + payload).digest()
             header = struct.pack(HEADER_FORMAT, 0, self.send_seq, hash) # 0 indicate this packet is data, not ack
             packet = header + payload
 
@@ -152,8 +149,8 @@ class Streamer:
 
         # Send a FIN packet
         self.fin_ack = False
-        empty_hash = hashlib.md5(b'').digest()
-        fin_header = struct.pack(HEADER_FORMAT, 2, self.send_seq, empty_hash)
+        fin_hash = hashlib.md5(struct.pack("!BI", 2, self.send_seq) + b'').digest()
+        fin_header = struct.pack(HEADER_FORMAT, 2, self.send_seq, fin_hash)
         timeout = 0.25
         start_time = time.time()
         self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
