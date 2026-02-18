@@ -33,6 +33,11 @@ class Streamer:
         self.fin = False 
         self.fin_ack = False
 
+        self.send_buffer = {}
+        self.base = 0
+        self.timer = None 
+        
+
         self.lock = threading.Lock()
         self.condval = threading.Condition(self.lock)
 
@@ -71,7 +76,19 @@ class Streamer:
 
                 elif type == 1: # ACK packet, send nothing
                     with self.lock:
-                        self.ack = True
+                        # Only remove the specific ACKed packet
+                        if seq in self.send_buffer:
+                            del self.send_buffer[seq]
+                        # Advance base past consecutive packets no longer in send_buffer
+                        while self.base not in self.send_buffer and self.base < self.send_seq:
+                            self.base += 1
+                        # Reset or cancel timer
+                        if self.send_buffer:
+                            self.start_timer()
+                        else:
+                            if self.timer is not None:
+                                self.timer.cancel()
+                                self.timer = None
 
                 elif type == 2: # FIN packet, send FIN-ACK back
                     empty_hash = hashlib.md5(b'').digest()
@@ -98,21 +115,16 @@ class Streamer:
             header = struct.pack(HEADER_FORMAT, 0, self.send_seq, hash) # 0 indicate this packet is data, not ack
             packet = header + payload
 
-            # Timeout for waiting for ACKs
-            self.ack = False 
-            timeout = 0.25
-            start_time = time.time()
-            self.socket.sendto(packet, (self.dst_ip, self.dst_port)) 
+            with self.lock:
+                self.send_buffer[self.send_seq] = packet
+                self.send_seq += 1
 
-            # Wait for ACK from the send above
-            while not self.ack:
-                if time.time() - start_time > timeout: 
-                    # Exceed timeout, resend packet (retransmission)
-                    self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-                    start_time = time.time() # Reset Timer
-                time.sleep(0.01)
-            
-            self.send_seq += 1
+                # If it is the first unacked packet, start the timer
+                if self.timer is None:
+                    self.start_timer()
+
+            # Send immediately
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port)) 
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""        
@@ -131,6 +143,13 @@ class Streamer:
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
+        # Make sure all our in-flight packets are ACKed
+        while True: 
+            with self.lock:
+                if not self.send_buffer:
+                    break
+            time.sleep(0.01)
+
         # Send a FIN packet
         self.fin_ack = False
         empty_hash = hashlib.md5(b'').digest()
@@ -162,3 +181,21 @@ class Streamer:
             self.condval.notify_all()
 
         self.executor.shutdown(wait=True)
+
+    def start_timer(self):
+        # Helper function to start the timer
+        if self.timer is not None: 
+            self.timer.cancel()
+        self.timer = threading.Timer(0.25, self.retransmit)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def retransmit(self):
+        # Retransmit all packets in send_buffer
+        with self.lock:
+            for seq in sorted(self.send_buffer.keys()):
+                self.socket.sendto(self.send_buffer[seq], (self.dst_ip, self.dst_port))
+            if self.send_buffer:
+                self.start_timer()
+            else:
+                self.timer = None
